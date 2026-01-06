@@ -20,7 +20,7 @@ async def analyze_data(file: UploadFile = File(...)):
 
     # 2. Rule Execution (Deterministic)
     engine = RulesEngine(metadata)
-    rule_results = engine.run_all()
+    rule_results = engine.run_compliance() # Default: General Transaction
 
     # 3. Scoring
     scores = calculate_scores(rule_results)
@@ -64,6 +64,38 @@ async def analyze_data(file: UploadFile = File(...)):
 from pydantic import BaseModel
 from ai.agent import chat_about_dataset
 
+class ReEvaluateRequest(BaseModel):
+    metadata: dict
+    standard: str = "General Transaction"
+
+@router.post("/analyze/re-evaluate")
+async def re_evaluate_compliance(request: ReEvaluateRequest):
+    print(f"\n🔹 [API]: Re-evaluating for standard: {request.standard}")
+    try:
+        # Re-run rule engine with new standard
+        engine = RulesEngine(request.metadata)
+        rule_results = engine.run_compliance(request.standard)
+        
+        scores = calculate_scores(rule_results)
+        
+        # Re-run AI Agent
+        if os.environ.get("GOOGLE_API_KEY"):
+            from ai.agent import get_local_key # Ensure key check
+            if get_local_key():
+                 analysis = await run_advisory_agent(scores, request.metadata, request.standard)
+            else:
+                 analysis = {"executive_summary": "Skipped (No Key)", "remediation_steps": []}
+        else:
+            analysis = {"executive_summary": "Skipped (No Key)", "remediation_steps": []}
+            
+        return {
+            "scores": scores,
+            "analysis": analysis
+        }
+    except Exception as e:
+        print(f"   ❌ [API Error]: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 class ChatRequest(BaseModel):
     question: str
     context: dict
@@ -72,6 +104,7 @@ from fastapi import Request
 
 @router.post("/chat")
 async def chat(raw_request: Request):
+# ... (rest of chat endpoint)
     print("\n🔹 [API DEBUG]: /api/chat hit")
     try:
         body = await raw_request.json()

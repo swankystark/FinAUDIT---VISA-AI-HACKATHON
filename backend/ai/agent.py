@@ -9,15 +9,11 @@ from langchain_core.documents import Document
 from langgraph.graph import StateGraph, END
 import json
 from dotenv import load_dotenv
+import traceback
 
 # Force load .env, overriding system variables to ensure local file is used
 load_dotenv(override=True)
 
-def get_local_key():
-    """
-    Manually reads .env to ensure we get the file's exact content,
-    bypassing potentially stale system environment variables.
-    """
 def get_local_key():
     """
     Manually reads .env to ensure we get the file's exact content,
@@ -69,6 +65,7 @@ class AgentState(TypedDict):
     dataset_type: str
     insights: str
     analysis: dict
+    compliance_standard: str
 
 # Initialize LLM with Explicit Key from File
 llm = ChatGoogleGenerativeAI(
@@ -78,8 +75,6 @@ llm = ChatGoogleGenerativeAI(
 )
 
 # Initialize Embeddings with Explicit Key from File
-# Note: Embeddings might also fail if it's the same quota. But user only provided fallback for Chat/Completion.
-# We will assume Embeddings are separate or user accepts failure there for now.
 embeddings = GoogleGenerativeAIEmbeddings(
     model="models/embedding-001",
     google_api_key=get_local_key()
@@ -133,12 +128,8 @@ def fallback_gemini_rapidapi(messages: List[BaseMessage]) -> str:
         response = requests.post(url, json=payload, headers=headers)
         response.raise_for_status()
         data = response.json()
-        # Parse response based on user provided structure or standard candidates
-        # User provided: print(response.json()) but implied standard structure
-        # Standard Gemini JSON structure:
         answer = data.get('candidates', [{}])[0].get('content', {}).get('parts', [{}])[0].get('text', '')
         if not answer:
-             # Try fallback parsing if structure differs
              print(f"   ❌ [Fallback]: Unexpected response format: {data}")
              raise ValueError("Empty response from RapidAPI")
              
@@ -149,21 +140,16 @@ def fallback_gemini_rapidapi(messages: List[BaseMessage]) -> str:
         print(f"   ❌ [Fallback]: RapidAPI also failed: {e}")
         raise e
 
-import traceback
-
 def invoke_llm_with_fallback(messages: List[BaseMessage]):
     """Synchronous wrapper"""
     try:
         api_key = get_local_key()
-        # USER REQUEST: Show full key explicitly for debugging
         print(f"   🔑 [LLM DEBUG]: Using GOOGLE_API_KEY (FULL): '{api_key}'")
         print(f"   📨 [LLM Request Payload]: {messages}")
         
         response = llm.invoke(messages)
         return response
     except Exception as e:
-        # Check for specific error codes if possible, or just catch all for robustness
-        # User asked for "exhaust or 400 or 429 or 500"
         print("   ❌ [LLM Error Traceback]:")
         traceback.print_exc()
         
@@ -177,7 +163,6 @@ async def invoke_llm_with_fallback_async(messages: List[BaseMessage]):
     """Async wrapper"""
     try:
         api_key = get_local_key()
-        # USER REQUEST: Show full key explicitly for debugging
         print(f"   🔑 [LLM ASYNC DEBUG]: Using GOOGLE_API_KEY (FULL): '{api_key}'")
         print(f"   📨 [LLM ASYNC Request Payload]: {messages}")
 
@@ -190,7 +175,6 @@ async def invoke_llm_with_fallback_async(messages: List[BaseMessage]):
         err_str = str(e).lower()
         if any(x in err_str for x in ["400", "429", "500", "resourceexhausted", "quota", "getaddrinfo"]):
             loop = asyncio.get_running_loop()
-            # Run specific fallback logic in thread to avoid blocking loop
             content = await loop.run_in_executor(None, fallback_gemini_rapidapi, messages)
             return AIMessage(content=content)
         raise e
@@ -207,7 +191,6 @@ def privacy_guardrail(state: AgentState):
     metadata = state["metadata"]
     columns = metadata.get("columns", {})
     
-    # Heuristic check for raw PII in column names
     pii_keywords = ["ssn", "password", "social_security"]
     found_pii = [col for col in columns if any(k in col.lower() for k in pii_keywords)]
     
@@ -271,12 +254,14 @@ def advisory_agent(state: AgentState):
     metadata = state["metadata"]
     context = state["dataset_type"]
     insights = state["insights"]
+    standard = state.get("compliance_standard", "General Transaction")
     
     system_prompt = f"""You are an Expert Financial Compliance Advisor.
+    Compliance Standard: {standard}
     Context: {context}
     Insights: {insights}
     
-    Role: Analyze the following scores and rule details to generate a prioritized remediation plan.
+    Role: Analyze the following scores and rule details to generate a prioritized remediation plan SPECIFICALLY for {standard} compliance.
     
     **Priority Logic**:
     - **CRITICAL**: Security gaps (PCI DSS, PII), Major Fraud risks, Clear Regulatory violations.
@@ -286,8 +271,8 @@ def advisory_agent(state: AgentState):
 
     Output strictly valid JSON:
     {{
-        "executive_summary": "One sentence overview.",
-        "risk_assessment": "Short paragraph on compliance risks.",
+        "executive_summary": "One sentence overview focusing on {standard} adherence.",
+        "risk_assessment": "Short paragraph on {standard} compliance risks.",
         "remediation_steps": [
             {{"issue": "Brief issue title", "action": "Specific fix action", "priority": "CRITICAL/HIGH/MEDIUM/LOW"}}
         ]
@@ -340,11 +325,11 @@ workflow.add_edge("advisory_agent", END)
 
 app = workflow.compile()
 
-async def run_advisory_agent(scores: dict, metadata: dict) -> dict:
+async def run_advisory_agent(scores: dict, metadata: dict, standard: str = "General Transaction") -> dict:
     """
     Entry point to run the multi-agent system.
     """
-    print("\n--- 🤖 Starting Multi-Agent Compliance Analysis ---")
+    print(f"\n--- 🤖 Starting Multi-Agent Compliance Analysis ({standard}) ---")
     
     initial_state = {
         "scores": scores,
@@ -352,7 +337,8 @@ async def run_advisory_agent(scores: dict, metadata: dict) -> dict:
         "privacy_check": "",
         "dataset_type": "",
         "insights": "",
-        "analysis": {}
+        "analysis": {},
+        "compliance_standard": standard
     }
     
     result = await app.ainvoke(initial_state)
